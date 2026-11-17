@@ -33,7 +33,7 @@ use cosmic::{
     },
 };
 
-use zbus::blocking::Connection;
+use zbus::Connection;
 use zvariant::OwnedObjectPath;
 
 use log::{error, info};
@@ -104,7 +104,6 @@ pub struct StatsRefresh {
     networks: Option<(Network, Network)>,
     disks: Option<(Disks, Disks)>,
     gpus: BTreeMap<String, Gpu>,
-    restart_gpus: bool,
 }
 
 impl StatsRefresh {
@@ -127,9 +126,6 @@ impl StatsRefresh {
             disks2.update();
         }
         for gpu in self.gpus.values_mut() {
-            if self.restart_gpus && !gpu.is_active() {
-                gpu.restart();
-            }
             gpu.update();
         }
     }
@@ -1060,9 +1056,10 @@ impl cosmic::Application for Minimon {
 
             Message::SlowTimer => {
                 if self.is_laptop {
-                    return Task::perform(async { Minimon::is_on_ac().unwrap_or(true) }, |on_ac| {
-                        cosmic::Action::App(Message::PowerChanged(on_ac))
-                    });
+                    return Task::perform(
+                        async { Minimon::is_on_ac().await.unwrap_or(true) },
+                        |on_ac| cosmic::Action::App(Message::PowerChanged(on_ac)),
+                    );
                 }
             }
 
@@ -2246,7 +2243,6 @@ impl Minimon {
             networks: refresh_networks.then(|| (self.network1.clone(), self.network2.clone())),
             disks: refresh_disks.then(|| (self.disks1.clone(), self.disks2.clone())),
             gpus,
-            restart_gpus: all,
         };
 
         self.refresh_in_flight = true;
@@ -2294,7 +2290,11 @@ impl Minimon {
                     .get(&id)
                     .is_some_and(|current| !current.is_active())
                 {
-                    gpu.stop();
+                    if self.popup.is_some() {
+                        gpu.restart();
+                    } else {
+                        gpu.stop();
+                    }
                 }
                 self.gpus.insert(id, gpu);
             }
@@ -2383,26 +2383,28 @@ impl Minimon {
         !self.gpus.is_empty()
     }
 
-    fn is_on_ac() -> Result<bool, Box<dyn std::error::Error>> {
-        let connection = Connection::system()?;
-        let proxy = zbus::blocking::Proxy::new(
+    async fn is_on_ac() -> Result<bool, Box<dyn std::error::Error>> {
+        let connection = Connection::system().await?;
+        let proxy = zbus::Proxy::new(
             &connection,
             "org.freedesktop.UPower",
             "/org/freedesktop/UPower",
             "org.freedesktop.UPower",
-        )?;
-        let devices: Vec<OwnedObjectPath> = proxy.call("EnumerateDevices", &())?;
+        )
+        .await?;
+        let devices: Vec<OwnedObjectPath> = proxy.call("EnumerateDevices", &()).await?;
 
         for device_path in devices {
-            let device_proxy = zbus::blocking::Proxy::new(
+            let device_proxy = zbus::Proxy::new(
                 &connection,
                 "org.freedesktop.UPower",
                 device_path.as_str(),
                 "org.freedesktop.UPower.Device",
-            )?;
-            let kind: u32 = device_proxy.get_property("Type")?;
+            )
+            .await?;
+            let kind: u32 = device_proxy.get_property("Type").await?;
             if kind == 1 {
-                return Ok(device_proxy.get_property("Online")?);
+                return Ok(device_proxy.get_property("Online").await?);
             }
         }
 

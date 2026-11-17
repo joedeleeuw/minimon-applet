@@ -737,6 +737,8 @@ impl DemoGraph for VramGraph {
 #[derive(Clone)]
 pub struct Gpu {
     gpu_if: Arc<std::sync::Mutex<Box<dyn GpuIf>>>,
+    name: String,
+    id: String,
     pub gpu: GpuGraph,
     pub vram: VramGraph,
     pub temp: TempGraph,
@@ -756,13 +758,16 @@ impl std::fmt::Debug for Gpu {
 impl Gpu {
     pub fn new(gpu_if: Box<dyn GpuIf>) -> Self {
         let total = gpu_if.vram_total();
+        let name = gpu_if.name();
         let id = gpu_if.id();
 
         Gpu {
             gpu_if: Arc::new(std::sync::Mutex::new(gpu_if)),
+            name,
             gpu: GpuGraph::new(&id),
             vram: VramGraph::new(&id, total as f64 / 1_073_741_824.0),
             temp: TempGraph::new(&id),
+            id,
             is_laptop: false,
             config: GpuConfig::default(),
         }
@@ -778,17 +783,11 @@ impl Gpu {
     }
 
     pub fn name(&self) -> String {
-        self.gpu_if
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .name()
+        self.name.clone()
     }
 
     pub fn id(&self) -> String {
-        self.gpu_if
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .id()
+        self.id.clone()
     }
 
     pub fn set_laptop(&mut self) {
