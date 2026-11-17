@@ -3,6 +3,7 @@ use hex;
 use log::{debug, info};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
+use std::env;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
@@ -15,6 +16,8 @@ use crate::sensors::gpus::Gpu;
 pub struct AmdGpu {
     name: String,
     id: String,
+    pci_slot: String,
+    device_path: PathBuf,
     usage_path: String,
     vram_used_path: String,
     power_status_path: String,
@@ -23,13 +26,22 @@ pub struct AmdGpu {
     paused: bool,
 }
 
+struct AmdPciDevice {
+    pci_slot: String,
+    path: PathBuf,
+    device_id: String,
+}
+
 impl AmdGpu {
-    pub fn new(name: &str, card: &str, id: &str, vram_total: u64) -> Self {
-        let base = format!("/sys/class/drm/{card}/device");
-        let temp_input_path = AmdGpu::find_temp_input_path(card);
+    pub fn new(name: &str, pci_slot: &str, id: &str, vram_total: u64) -> Self {
+        let device_path = PathBuf::from(format!("/sys/bus/pci/devices/{pci_slot}"));
+        let base = device_path.to_string_lossy().to_string();
+        let temp_input_path = AmdGpu::find_temp_input_path(&device_path);
         Self {
             name: name.to_string(),
             id: id.to_string(),
+            pci_slot: pci_slot.to_string(),
+            device_path,
             usage_path: format!("{base}/gpu_busy_percent"),
             vram_used_path: format!("{base}/mem_info_vram_used"),
             power_status_path: format!("{base}/power/runtime_status"),
@@ -37,6 +49,12 @@ impl AmdGpu {
             vram_total,
             paused: false,
         }
+    }
+
+    fn driver_name(&self) -> Option<String> {
+        fs::read_link(self.device_path.join("driver"))
+            .ok()
+            .and_then(|path| path.file_name().map(|name| name.to_string_lossy().to_string()))
     }
 
     fn powered_on(&self) -> bool {
@@ -55,39 +73,76 @@ impl AmdGpu {
         fs::read_to_string(path).map(|s| s.trim().to_string())
     }
 
-    fn get_amd_cards() -> Vec<String> {
-        debug!("AmdGpu::get_amd_cards().");
-        let mut cards = Vec::new();
-        if let Ok(entries) = fs::read_dir("/sys/class/drm/") {
+    fn env_truthy(name: &str) -> bool {
+        env::var(name)
+            .map(|value| matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(false)
+    }
+
+    fn configured_device_ids() -> Option<Vec<String>> {
+        let raw = env::var("MINIMON_AMD_DEVICE_IDS").ok()?;
+        let ids = raw
+            .split(',')
+            .map(|id| id.trim().to_ascii_lowercase())
+            .filter(|id| !id.is_empty())
+            .collect::<Vec<_>>();
+
+        (!ids.is_empty()).then_some(ids)
+    }
+
+    fn get_amd_pci_devices() -> Vec<AmdPciDevice> {
+        debug!("AmdGpu::get_amd_pci_devices().");
+        let mut devices = Vec::new();
+        let device_filter = Self::configured_device_ids();
+        let hide_boot_vga = Self::env_truthy("MINIMON_HIDE_BOOT_VGA");
+
+        if let Ok(entries) = fs::read_dir("/sys/bus/pci/devices") {
             for entry in entries.flatten() {
                 let path = entry.path();
                 debug!("                    entry {path:?}");
-                if path.join("device/vendor").exists()
-                    && let Ok(vendor_id) = Self::read_file_to_string(path.join("device/vendor"))
+                let Ok(vendor_id) = Self::read_file_to_string(path.join("vendor")) else {
+                    continue;
+                };
+                if !vendor_id.eq_ignore_ascii_case("0x1002") {
+                    debug!("                    Not AMD");
+                    continue;
+                }
+
+                let Ok(device_id) = Self::read_file_to_string(path.join("device")) else {
+                    continue;
+                };
+                if let Some(filter) = &device_filter
+                    && !filter.iter().any(|id| id.eq_ignore_ascii_case(&device_id))
                 {
-                    if vendor_id == "0x1002" {
-                        debug!("                    AMD vendor ID");
-                        if let Some(card) = path.file_name().and_then(|n| n.to_str()) {
-                            if card.contains("card") {
-                                debug!("                    phyical Card.");
-                                cards.push(card.to_string());
-                            } else {
-                                debug!("                    virtual card");
-                            }
-                        }
-                    } else {
-                        debug!("                    Not AMD");
-                    }
+                    continue;
+                }
+
+                let pci_class = Self::read_file_to_string(path.join("class")).unwrap_or_default();
+                if !pci_class.starts_with("0x03") {
+                    continue;
+                }
+
+                let boot_vga = Self::read_file_to_string(path.join("boot_vga")).unwrap_or_default();
+                if hide_boot_vga && boot_vga == "1" {
+                    continue;
+                }
+
+                if let Some(pci_slot) = path.file_name().and_then(|name| name.to_str()) {
+                    devices.push(AmdPciDevice {
+                        pci_slot: pci_slot.to_ascii_lowercase(),
+                        path,
+                        device_id,
+                    });
                 }
             }
         }
-        cards
+        devices.sort_by(|a, b| a.pci_slot.cmp(&b.pci_slot));
+        devices
     }
 
-    fn find_temp_input_path(card: &str) -> Option<String> {
-        log::info!("AMD find_temp_input_path({card})");
-        let hwmon_base = format!("/sys/class/drm/{card}/device/hwmon");
-        let entries = fs::read_dir(hwmon_base).ok()?;
+    fn find_temp_input_path(device_path: &Path) -> Option<String> {
+        log::info!("AMD find_temp_input_path({device_path:?})");
+        let entries = fs::read_dir(device_path.join("hwmon")).ok()?;
 
         for entry in entries.flatten() {
             let path = entry.path().join("temp1_input");
@@ -101,20 +156,20 @@ impl AmdGpu {
         None
     }
 
-    fn get_vram_total(card: &str) -> Option<u64> {
-        let path = format!("/sys/class/drm/{card}/device/mem_info_vram_total");
-        Self::parse_u64_file(&path)
+    fn get_vram_total(device_path: &Path, device_id: &str) -> u64 {
+        let path = device_path.join("mem_info_vram_total");
+        Self::read_file_to_string(path)
+            .ok()
+            .and_then(|value| value.parse::<u64>().ok())
+            .or_else(|| Self::fallback_vram_total(device_id))
+            .unwrap_or(0)
     }
 
-    fn get_pci_slot(card: &str) -> Option<String> {
-        let path = format!("/sys/class/drm/{card}/device/uevent");
-        Self::read_file_to_string(path)
-            .ok()?
-            .lines()
-            .find_map(|line| {
-                line.strip_prefix("PCI_SLOT_NAME=")
-                    .map(|s| s.to_lowercase().to_string())
-            })
+    fn fallback_vram_total(device_id: &str) -> Option<u64> {
+        match device_id.to_ascii_lowercase().as_str() {
+            "0x744c" => Some(24 * 1024 * 1024 * 1024),
+            _ => None,
+        }
     }
 
     fn get_lspci_gpu_names() -> Vec<(String, String)> {
@@ -158,40 +213,27 @@ impl AmdGpu {
         map
     }
 
-    fn get_gpu_name(card: &str, lspci_map: &Vec<(String, String)>) -> String {
-        info!("Resolving GPU name for card: {card}");
+    fn get_gpu_name(device: &AmdPciDevice, lspci_map: &Vec<(String, String)>) -> String {
+        info!("Resolving GPU name for PCI device: {}", device.pci_slot);
 
-        // Use static lookup table first, with nice names
-        let device_id_path = format!("/sys/class/drm/{card}/device/device");
-        if let Ok(dev_id) = AmdGpu::read_file_to_string(&device_id_path) {
-            info!("Read device ID from sysfs: {dev_id}");
-            if let Some(name) = AMD_GPU_DEVICE_IDS.get(dev_id.to_uppercase().as_str()) {
-                debug!("Found name in static map: {name}");
-                return (*name).to_string();
-            }
-            info!("No entry in static map for device ID: {dev_id}");
-        } else {
-            debug!("Failed to read device ID from path: {device_id_path}");
+        if let Some(name) = AMD_GPU_DEVICE_IDS.get(device.device_id.to_uppercase().as_str()) {
+            debug!("Found name in static map: {name}");
+            return (*name).to_string();
         }
 
-        // Fallback: Get PCI slot and look for it in the lspci list
-        if let Some(slot) = &AmdGpu::get_pci_slot(card) {
-            info!("Resolved PCI slot for card {card}: {slot:?}");
-            for (p, n) in lspci_map {
-                if slot.contains(p) {
-                    info!("Found name in lspci_map: {n}");
-                    return n.clone();
-                }
+        for (p, n) in lspci_map {
+            if device.pci_slot.contains(p) {
+                info!("Found name in lspci_map: {n}");
+                return n.clone();
             }
-            debug!("No entry in lspci_map for slot: {slot}");
         }
+        debug!("No entry in lspci_map for slot: {}", device.pci_slot);
 
         debug!("Falling back to unknown GPU name");
         "Unknown AMD GPU".to_string()
     }
 
-    fn generate_gpu_id(card: &str) -> Option<String> {
-        let device_path = PathBuf::from(format!("/sys/class/drm/{card}/device"));
+    fn generate_gpu_id(device_path: &Path) -> Option<String> {
         let pci_address = device_path.canonicalize().ok()?;
         let subsystem_vendor =
             Self::read_file_to_string(device_path.join("subsystem_vendor")).ok()?;
@@ -217,20 +259,22 @@ impl AmdGpu {
             debug!("  {k} -> {v}");
         }
 
-        let cards = AmdGpu::get_amd_cards();
+        let devices = AmdGpu::get_amd_pci_devices();
 
-        for card in cards {
-            debug!("                    Found card {card}");
-            if let Some(vram_total) = AmdGpu::get_vram_total(&card) {
-                debug!("                    total vram {vram_total}");
-                if let Some(id) = AmdGpu::generate_gpu_id(&card) {
-                    debug!("                    id {id}");
-                    let name = AmdGpu::get_gpu_name(&card, &lspci_map);
-                    debug!("                    name {name}");
-                    gpus.push(Gpu::new(Box::new(AmdGpu::new(
-                        &name, &card, &id, vram_total,
-                    ))));
-                }
+        for device in devices {
+            debug!("                    Found AMD PCI device {}", device.pci_slot);
+            let vram_total = AmdGpu::get_vram_total(&device.path, &device.device_id);
+            debug!("                    total vram {vram_total}");
+            if let Some(id) = AmdGpu::generate_gpu_id(&device.path) {
+                debug!("                    id {id}");
+                let name = AmdGpu::get_gpu_name(&device, &lspci_map);
+                debug!("                    name {name}");
+                gpus.push(Gpu::new(Box::new(AmdGpu::new(
+                    &name,
+                    &device.pci_slot,
+                    &id,
+                    vram_total,
+                ))));
             }
         }
         gpus
@@ -249,7 +293,7 @@ impl super::GpuIf for AmdGpu {
     }
 
     fn is_active(&self) -> bool {
-        !self.paused
+        !self.paused && self.driver_name().as_deref() == Some("amdgpu")
     }
 
     fn name(&self) -> String {
@@ -258,6 +302,27 @@ impl super::GpuIf for AmdGpu {
 
     fn id(&self) -> String {
         self.id.clone()
+    }
+
+    fn panel_label(&self) -> String {
+        let bus = self.pci_slot.split(':').nth(1).unwrap_or(&self.pci_slot);
+        format!("G{}", bus.to_ascii_uppercase())
+    }
+
+    fn panel_sort_key(&self) -> String {
+        self.pci_slot.clone()
+    }
+
+    fn inactive_label(&self) -> String {
+        if self.paused {
+            "---%".to_string()
+        } else {
+            match self.driver_name().as_deref() {
+                None => "AM".to_string(),
+                Some("amdgpu") => "---%".to_string(),
+                Some(_) => "DRV".to_string(),
+            }
+        }
     }
 
     fn vram_total(&self) -> u64 {

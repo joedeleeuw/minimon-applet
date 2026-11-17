@@ -7,6 +7,15 @@ pub mod nvidia;
 pub trait GpuIf: Send {
     fn name(&self) -> String;
     fn id(&self) -> String;
+    fn panel_label(&self) -> String {
+        "GPU".to_string()
+    }
+    fn panel_sort_key(&self) -> String {
+        self.id()
+    }
+    fn inactive_label(&self) -> String {
+        "---%".to_string()
+    }
     fn usage(&self) -> Result<u32>;
 
     // Temp in millidegrees Celsius

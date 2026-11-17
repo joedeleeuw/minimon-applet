@@ -503,7 +503,9 @@ impl cosmic::Application for Minimon {
                         elements.extend(self.disks_panel_ui(horizontal));
                     }
                     ContentType::GpuInfo => {
-                        for gpu in self.gpus.values() {
+                        let mut gpus = self.gpus.values().collect::<Vec<_>>();
+                        gpus.sort_by_key(|gpu| gpu.panel_sort_key());
+                        for gpu in gpus {
                             elements.extend(self.gpu_panel_ui(gpu, horizontal));
                         }
                     }
@@ -1711,6 +1713,21 @@ impl Minimon {
         elements.push_back(widget::text::body(label.to_string()).size(size).into());
     }
 
+    fn metric_value<'a>(&self, label: String, value: String, width: Option<f32>) -> Element<'a, Message> {
+        let title_size = self.label_font_size().saturating_sub(3).max(7);
+        let title = widget::text(label)
+            .size(title_size)
+            .wrapping(iced::core::text::Wrapping::None)
+            .align_x(Horizontal::Center);
+
+        Column::new()
+            .align_x(Alignment::Center)
+            .spacing(0)
+            .push(title)
+            .push(self.figure_value(value, width))
+            .into()
+    }
+
     fn simple_ui(&'_ self) -> VecDeque<Element<'_, crate::app::Message>> {
         let mut elements: VecDeque<Element<Message>> = VecDeque::new();
         elements.push_front(
@@ -2067,11 +2084,7 @@ impl Minimon {
                 || config.vram.value_visible()
                 || config.vram.chart_visible();
 
-            if config.usage.label_visible() && gpu_has_content {
-                self.push_text_label(&mut elements, &fl!("label-gpu"));
-            }
-
-            let formatted_gpu = gpu.gpu.to_string();
+            let formatted_gpu = gpu.usage_string();
             let formatted_vram = gpu.vram.string(!horizontal);
             let stacked_values =
                 config.stack_values && config.usage.value_visible() && config.vram.value_visible();
@@ -2079,17 +2092,30 @@ impl Minimon {
             if stacked_values {
                 let gpu_values = vec![
                     widget::space::vertical().into(),
-                    self.figure_value(formatted_gpu, self.value_gpu_width)
-                        .into(),
+                    if config.usage.label_visible() {
+                        self.metric_value(gpu.panel_label(), formatted_gpu, self.value_gpu_width)
+                    } else {
+                        self.figure_value(formatted_gpu, self.value_gpu_width).into()
+                    },
                     self.figure_value(formatted_vram.clone(), None).into(),
                     widget::space::vertical().into(),
                 ];
                 elements.push_back(Column::from_vec(gpu_values).into());
             } else if config.usage.value_visible() {
-                elements.push_back(
-                    self.figure_value(formatted_gpu, self.value_gpu_width)
-                        .into(),
-                );
+                if config.usage.label_visible() {
+                    elements.push_back(self.metric_value(
+                        gpu.panel_label(),
+                        formatted_gpu,
+                        self.value_gpu_width,
+                    ));
+                } else {
+                    elements.push_back(
+                        self.figure_value(formatted_gpu, self.value_gpu_width)
+                            .into(),
+                    );
+                }
+            } else if config.usage.label_visible() && gpu_has_content {
+                self.push_text_label(&mut elements, &gpu.panel_label());
             }
 
             if config.usage.chart_visible() {

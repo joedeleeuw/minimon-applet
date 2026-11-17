@@ -2,7 +2,7 @@ use anyhow::{Context, Result, anyhow};
 use log::{debug, info, warn};
 use nvml_wrapper::{Device, Nvml, error::NvmlError};
 
-use std::sync::LazyLock;
+use std::{fs, sync::LazyLock};
 
 use crate::sensors::gpus::Gpu;
 
@@ -110,7 +110,11 @@ impl NvidiaGpu<'_> {
     pub fn get_gpus() -> Vec<Gpu> {
         let mut v: Vec<Gpu> = Vec::new();
 
-        // Nvidia GPUs
+        if let Some(false) = Self::has_nvidia_pci_device() {
+            debug!("No Nvidia PCI devices found");
+            return v;
+        }
+
         if let Ok(count) = NvidiaGpu::gpus() {
             let nvidia_gpus = (0..count)
                 .filter_map(|i| {
@@ -127,6 +131,16 @@ impl NvidiaGpu<'_> {
             info!("No Nvidia GPUs found");
         }
         v
+    }
+
+    fn has_nvidia_pci_device() -> Option<bool> {
+        let entries = fs::read_dir("/sys/bus/pci/devices").ok()?;
+
+        Some(entries.flatten().any(|entry| {
+            fs::read_to_string(entry.path().join("vendor"))
+                .map(|vendor| vendor.trim().eq_ignore_ascii_case("0x10de"))
+                .unwrap_or(false)
+        }))
     }
 
     pub fn uuid(idx: u32) -> Result<String> {

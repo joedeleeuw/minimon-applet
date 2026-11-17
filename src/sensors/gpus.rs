@@ -790,6 +790,31 @@ impl Gpu {
         self.id.clone()
     }
 
+    pub fn panel_label(&self) -> String {
+        self.gpu_if
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .panel_label()
+    }
+
+    pub fn panel_sort_key(&self) -> String {
+        self.gpu_if
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .panel_sort_key()
+    }
+
+    pub fn usage_string(&self) -> String {
+        if self.gpu.disabled {
+            self.gpu_if
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .inactive_label()
+        } else {
+            self.gpu.to_string()
+        }
+    }
+
     pub fn set_laptop(&mut self) {
         self.is_laptop = true;
     }
@@ -824,6 +849,9 @@ impl Gpu {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         if gpu_if.is_active() {
+            self.gpu.disabled = false;
+            self.vram.disabled = false;
+            self.temp.disabled = false;
             if let Ok(sample) = gpu_if.usage() {
                 self.gpu.update(sample);
             }
@@ -833,6 +861,13 @@ impl Gpu {
             if let Ok(sample) = gpu_if.temperature() {
                 self.temp.update(sample);
             }
+        } else {
+            self.gpu.clear();
+            self.vram.clear();
+            self.temp.clear();
+            self.gpu.disabled = true;
+            self.vram.disabled = true;
+            self.temp.disabled = true;
         }
     }
 
