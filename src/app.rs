@@ -96,12 +96,44 @@ pub static SETTINGS_DISKS_HEADING: LazyLock<&'static str> =
     LazyLock::new(|| fl!("disks-title").leak());
 pub static SETTINGS_GPU_HEADING: LazyLock<&'static str> = LazyLock::new(|| fl!("gpu-title").leak());
 
-// The UI requires static lifetime of dropdown items
-pub static SYSMON_LIST: LazyLock<BTreeMap<String, system_monitors::DesktopApp>> =
-    LazyLock::new(system_monitors::get_desktop_applications);
+#[derive(Debug, Clone)]
+pub struct StatsRefresh {
+    cpu: Option<Cpu>,
+    cputemp: Option<CpuTemp>,
+    memory: Option<Memory>,
+    networks: Option<(Network, Network)>,
+    disks: Option<(Disks, Disks)>,
+    gpus: BTreeMap<String, Gpu>,
+    restart_gpus: bool,
+}
 
-pub static SYSMON_NAMES: LazyLock<Vec<&'static str>> =
-    LazyLock::new(|| SYSMON_LIST.values().map(|app| app.name.as_str()).collect());
+impl StatsRefresh {
+    fn refresh(&mut self) {
+        if let Some(cpu) = &mut self.cpu {
+            cpu.update();
+        }
+        if let Some(cputemp) = &mut self.cputemp {
+            cputemp.update();
+        }
+        if let Some(memory) = &mut self.memory {
+            memory.update();
+        }
+        if let Some((network1, network2)) = &mut self.networks {
+            network1.update();
+            network2.update();
+        }
+        if let Some((disks1, disks2)) = &mut self.disks {
+            disks1.update();
+            disks2.update();
+        }
+        for gpu in self.gpus.values_mut() {
+            if self.restart_gpus && !gpu.is_active() {
+                gpu.restart();
+            }
+            gpu.update();
+        }
+    }
+}
 
 macro_rules! network_select {
     ($self:ident, $variant:expr) => {
@@ -162,6 +194,12 @@ pub struct Minimon {
 
     //GPUs, in Btree so they're always ordered the same.
     gpus: BTreeMap<String, Gpu>,
+    unsupported_intel_gpu: bool,
+    refresh_in_flight: bool,
+
+    system_monitors: BTreeMap<String, system_monitors::DesktopApp>,
+    system_monitor_names: Vec<String>,
+    config_save_error: Option<String>,
 
     /// The popup id.
     popup: Option<Id>,
@@ -242,7 +280,9 @@ pub enum Message {
 
     SelectGraphType(DeviceKind, ChartKind),
     Tick,
+    StatsRefreshed(Box<StatsRefresh>),
     SlowTimer,
+    PowerChanged(bool),
     PopupClosed(Id),
 
     ToggleCpuChart(bool),
@@ -264,7 +304,9 @@ pub enum Message {
     ToggleMemoryAllocated(bool),
     ConfigChanged(Box<MinimonConfig>),
     ThemeChanged(Box<cosmic::config::CosmicTk>),
-    LaunchSystemMonitor(&'static system_monitors::DesktopApp),
+    SystemMonitorsDiscovered(BTreeMap<String, system_monitors::DesktopApp>),
+    LaunchSystemMonitor(system_monitors::DesktopApp),
+    SystemMonitorLaunched,
     RefreshRateChanged(f64),
     ValueSizeChanged(u16),
     ToggleMonospaceValues(bool),
@@ -309,8 +351,6 @@ impl cosmic::Application for Minimon {
             info!("Is laptop");
         }
 
-        LazyLock::force(&SYSMON_LIST);
-
         // Find GPUs
         let gpus: BTreeMap<String, Gpu> = list_gpus()
             .into_iter()
@@ -323,6 +363,8 @@ impl cosmic::Application for Minimon {
             })
             .collect();
 
+        let unsupported_intel_gpu =
+            gpus.is_empty() && crate::sensors::gpu::intel::IntelGpu::is_present();
         let is_horizontal = core.applet.is_horizontal();
 
         let mut app = Minimon {
@@ -335,6 +377,11 @@ impl cosmic::Application for Minimon {
             disks1: Disks::default(),
             disks2: Disks::default(),
             gpus,
+            unsupported_intel_gpu,
+            refresh_in_flight: false,
+            system_monitors: BTreeMap::new(),
+            system_monitor_names: Vec::new(),
+            config_save_error: None,
             popup: None,
             settings_page: None,
             colorpicker: ColorPicker::default(),
@@ -361,7 +408,11 @@ impl cosmic::Application for Minimon {
                 .unwrap_or_default();
         app.config_changed(&config);
 
-        (app, Task::none())
+        let discover_monitors = Task::perform(
+            async { system_monitors::get_desktop_applications() },
+            |apps| cosmic::Action::App(Message::SystemMonitorsDiscovered(apps)),
+        );
+        (app, discover_monitors)
     }
 
     fn core(&self) -> &Core {
@@ -506,21 +557,13 @@ impl cosmic::Application for Minimon {
 
     // Settings popup, can be list overview, individual page or colorpicker
     fn view_window(&'_ self, _id: Id) -> Element<'_, Self::Message> {
-        // Get configured system monitor, else the DEFAULT one, else first one in the map, else None.
-        fn get_sysmon(name: &Option<String>) -> Option<&'static system_monitors::DesktopApp> {
-            match &name {
-                Some(key) if SYSMON_LIST.contains_key(key.as_str()) => {
-                    SYSMON_LIST.get(key.as_str())
-                }
-                _ => {
-                    if SYSMON_LIST.contains_key(DEFAULT_MONITOR) {
-                        SYSMON_LIST.get(DEFAULT_MONITOR)
-                    } else {
-                        SYSMON_LIST.values().next()
-                    }
-                }
-            }
-        }
+        let sysmon = self
+            .config
+            .sysmon
+            .as_ref()
+            .and_then(|name| self.system_monitors.get(name))
+            .or_else(|| self.system_monitors.get(DEFAULT_MONITOR))
+            .or_else(|| self.system_monitors.values().next());
         // Colorpicker
         if self.colorpicker.active() {
             let limits = Limits::NONE
@@ -546,6 +589,12 @@ impl cosmic::Application for Minimon {
             };
 
             let mut content = Column::new();
+            if let Some(error) = &self.config_save_error {
+                content = content.push(
+                    text::body(format!("{}: {error}", fl!("config-save-error")))
+                        .wrapping(Wrapping::Word),
+                );
+            }
 
             if let Some(variant) = &self.settings_page {
                 match variant {
@@ -643,11 +692,11 @@ impl cosmic::Application for Minimon {
 
             // List settings overview
             } else {
-                if let Some(sysmon) = get_sysmon(&self.config.sysmon) {
+                if let Some(sysmon) = sysmon {
                     content = content.push(Element::from(row!(
                         widget::space::horizontal(),
                         widget::button::standard(sysmon.name.to_owned())
-                            .on_press(Message::LaunchSystemMonitor(sysmon))
+                            .on_press(Message::LaunchSystemMonitor(sysmon.clone()))
                             .trailing_icon(widget::button::link::icon()),
                         widget::space::horizontal()
                     )));
@@ -736,6 +785,11 @@ impl cosmic::Application for Minimon {
                             Message::Settings(Some(SettingsVariant::Gpu(key.clone()))),
                         ));
                     }
+                } else if self.unsupported_intel_gpu {
+                    sensor_settings = sensor_settings.add(settings::item(
+                        fl!("settings-gpu"),
+                        text::body(fl!("gpu-intel-unsupported")),
+                    ));
                 }
 
                 content = content.push(sensor_settings);
@@ -799,6 +853,7 @@ impl cosmic::Application for Minimon {
                 if self.popup.as_ref() == Some(&id) {
                     self.colorpicker.deactivate();
                     self.popup = None;
+                    self.maybe_stop_gpus();
                 }
             }
             Message::ColorPickerOpen(device, kind, id) => {
@@ -996,26 +1051,35 @@ impl cosmic::Application for Minimon {
             }
 
             Message::Tick => {
-                self.refresh_stats();
+                return self.start_stats_refresh();
+            }
+
+            Message::StatsRefreshed(stats) => {
+                self.apply_stats_refresh(*stats);
             }
 
             Message::SlowTimer => {
                 if self.is_laptop {
-                    let current_on_ac = self.is_on_ac().unwrap_or(true);
-                    if self.on_ac != current_on_ac {
-                        self.on_ac = current_on_ac;
+                    return Task::perform(async { Minimon::is_on_ac().unwrap_or(true) }, |on_ac| {
+                        cosmic::Action::App(Message::PowerChanged(on_ac))
+                    });
+                }
+            }
 
-                        for (id, gpu) in &mut self.gpus {
-                            if let Some(c) = self.config.gpus.get(id)
-                                && c.pause_on_battery
-                            {
-                                if current_on_ac {
-                                    info!("Changed to AC, restart polling");
-                                    gpu.restart(); // on AC, start polling
-                                } else {
-                                    info!("Changed to DC, stop polling");
-                                    gpu.stop(); // on battery, stop polling
-                                }
+            Message::PowerChanged(current_on_ac) => {
+                if self.on_ac != current_on_ac {
+                    self.on_ac = current_on_ac;
+
+                    for (id, gpu) in &mut self.gpus {
+                        if let Some(c) = self.config.gpus.get(id)
+                            && c.pause_on_battery
+                        {
+                            if current_on_ac {
+                                info!("Changed to AC, restart polling");
+                                gpu.restart();
+                            } else {
+                                info!("Changed to DC, stop polling");
+                                gpu.stop();
                             }
                         }
                     }
@@ -1198,10 +1262,23 @@ impl cosmic::Application for Minimon {
                 self.colorpicker.update_color(col);
             }
 
+            Message::SystemMonitorsDiscovered(system_monitors) => {
+                self.system_monitor_names = system_monitors
+                    .values()
+                    .map(|app| app.name.clone())
+                    .collect();
+                self.system_monitors = system_monitors;
+            }
+
             Message::LaunchSystemMonitor(desktop_app) => {
                 info!("Message::LaunchSystemMonitor() {}", desktop_app.name);
-                system_monitors::launch_desktop_app(desktop_app);
+                return Task::perform(
+                    async move { system_monitors::launch_desktop_app(&desktop_app) },
+                    |()| cosmic::Action::App(Message::SystemMonitorLaunched),
+                );
             }
+
+            Message::SystemMonitorLaunched => {}
 
             Message::RefreshRateChanged(rate) => {
                 info!("Message::RefreshRateChanged({rate:?})");
@@ -1232,7 +1309,7 @@ impl cosmic::Application for Minimon {
                 self.settings_page = setting;
             }
             Message::SysmonSelect(idx) => {
-                let name: Option<String> = SYSMON_NAMES.get(idx).map(|s| s.to_string());
+                let name = self.system_monitor_names.get(idx).cloned();
                 info!("Message::SysmonSelect({idx})->{name:?}");
                 self.config.sysmon = name;
                 self.save_config();
@@ -1535,11 +1612,13 @@ impl Minimon {
             .config
             .sysmon
             .as_ref()
-            .and_then(|n| SYSMON_NAMES.iter().position(|&app_name| app_name == n));
+            .and_then(|name| self.system_monitor_names.iter().position(|app| app == name));
 
         let sysmon_row = settings::item(
             fl!("choose-sysmon"),
-            row!(widget::dropdown(&*SYSMON_NAMES, idx, Message::SysmonSelect).width(220)),
+            row!(
+                widget::dropdown(&self.system_monitor_names, idx, Message::SysmonSelect).width(220)
+            ),
         );
 
         let content_items = Column::from_vec({
@@ -2061,18 +2140,26 @@ impl Minimon {
         }
     }
 
-    fn save_config(&self) {
+    fn save_config(&mut self) {
         info!("save_config()");
-        if let Ok(helper) = cosmic::cosmic_config::Config::new(
+        let result = cosmic::cosmic_config::Config::new(
             match self.core.applet.panel_type {
                 PanelType::Panel => APP_ID_PANEL,
                 PanelType::Dock => APP_ID_DOCK,
                 PanelType::Other(_) => APP_ID_OTHER,
             },
             MinimonConfig::VERSION,
-        ) && let Err(err) = self.config.write_entry(&helper)
-        {
-            info!("Error writing config {err}");
+        )
+        .map_err(|error| error.to_string())
+        .and_then(|helper| {
+            self.config
+                .write_entry(&helper)
+                .map_err(|error| error.to_string())
+        });
+
+        self.config_save_error = result.err();
+        if let Some(error) = &self.config_save_error {
+            error!("Error writing config {error}");
         }
     }
 
@@ -2125,50 +2212,91 @@ impl Minimon {
         }
     }
 
-    fn refresh_stats(&mut self) {
-        // Update everything if popup open
+    fn start_stats_refresh(&mut self) -> Task<Message> {
+        if self.refresh_in_flight {
+            return Task::none();
+        }
+
         let all = self.popup.is_some();
-
-        if all || self.config.cpu.visible() {
-            self.cpu.update();
-        }
-
-        if all || self.config.cputemp.visible() {
-            self.cputemp.update();
-        }
-
-        if all || self.config.memory.visible() {
-            self.memory.update();
-        }
-
         let combined_network = self.config.network1.variant == NetworkVariant::Combined;
-        if all
+        let refresh_networks = all
             || (combined_network && self.config.network1.visible())
             || (!combined_network
-                && (self.config.network1.visible() || self.config.network1.visible()))
-        {
-            self.network1.update();
-            self.network2.update();
-        }
-
+                && (self.config.network1.visible() || self.config.network2.visible()));
         let combined_disks = self.config.disks1.variant == DisksVariant::Combined;
-
-        if all
+        let refresh_disks = all
             || (combined_disks && self.config.disks1.visible())
-            || (!combined_disks && (self.config.disks1.visible() || self.config.disks2.visible()))
-        {
-            self.disks1.update();
-            self.disks2.update();
-        }
+            || (!combined_disks && (self.config.disks1.visible() || self.config.disks2.visible()));
+        let gpus = self
+            .gpus
+            .iter()
+            .filter(|(id, _)| {
+                self.config
+                    .gpus
+                    .get(*id)
+                    .is_some_and(|config| all || config.is_visible())
+            })
+            .map(|(id, gpu)| (id.clone(), gpu.clone()))
+            .collect();
 
-        for gpu in &mut self.gpus.values_mut() {
-            if let Some(g) = self.config.gpus.get(&gpu.id())
-                && (all || g.is_visible())
-            {
-                if all && !gpu.is_active() {
-                    gpu.restart();
+        let mut stats = StatsRefresh {
+            cpu: (all || self.config.cpu.visible()).then(|| self.cpu.clone()),
+            cputemp: (all || self.config.cputemp.visible()).then(|| self.cputemp.clone()),
+            memory: (all || self.config.memory.visible()).then(|| self.memory.clone()),
+            networks: refresh_networks.then(|| (self.network1.clone(), self.network2.clone())),
+            disks: refresh_disks.then(|| (self.disks1.clone(), self.disks2.clone())),
+            gpus,
+            restart_gpus: all,
+        };
+
+        self.refresh_in_flight = true;
+        Task::perform(
+            async move {
+                stats.refresh();
+                stats
+            },
+            |stats| cosmic::Action::App(Message::StatsRefreshed(Box::new(stats))),
+        )
+    }
+
+    fn apply_stats_refresh(&mut self, stats: StatsRefresh) {
+        self.refresh_in_flight = false;
+        let refresh_rate = self.config.refresh_rate;
+        if let Some(mut cpu) = stats.cpu {
+            cpu.update_config(&self.config.cpu, refresh_rate);
+            self.cpu = cpu;
+        }
+        if let Some(mut cputemp) = stats.cputemp {
+            cputemp.update_config(&self.config.cputemp, refresh_rate);
+            self.cputemp = cputemp;
+        }
+        if let Some(mut memory) = stats.memory {
+            memory.update_config(&self.config.memory, refresh_rate);
+            self.memory = memory;
+        }
+        if let Some((mut network1, mut network2)) = stats.networks {
+            network1.update_config(&self.config.network1, refresh_rate);
+            network2.update_config(&self.config.network2, refresh_rate);
+            self.network1 = network1;
+            self.network2 = network2;
+        }
+        if let Some((mut disks1, mut disks2)) = stats.disks {
+            disks1.update_config(&self.config.disks1, refresh_rate);
+            disks2.update_config(&self.config.disks2, refresh_rate);
+            self.disks1 = disks1;
+            self.disks2 = disks2;
+        }
+        for (id, mut gpu) in stats.gpus {
+            if let Some(config) = self.config.gpus.get(&id) {
+                gpu.update_config(config, refresh_rate);
+                if self
+                    .gpus
+                    .get(&id)
+                    .is_some_and(|current| !current.is_active())
+                {
+                    gpu.stop();
                 }
-                gpu.update();
+                self.gpus.insert(id, gpu);
             }
         }
     }
@@ -2255,37 +2383,26 @@ impl Minimon {
         !self.gpus.is_empty()
     }
 
-    fn is_on_ac(&self) -> Result<bool, Box<dyn std::error::Error>> {
-        if self.is_laptop {
-            // Connect to the system bus
-            let connection = Connection::system()?;
+    fn is_on_ac() -> Result<bool, Box<dyn std::error::Error>> {
+        let connection = Connection::system()?;
+        let proxy = zbus::blocking::Proxy::new(
+            &connection,
+            "org.freedesktop.UPower",
+            "/org/freedesktop/UPower",
+            "org.freedesktop.UPower",
+        )?;
+        let devices: Vec<OwnedObjectPath> = proxy.call("EnumerateDevices", &())?;
 
-            // Create a proxy to UPower service
-            let proxy = zbus::blocking::Proxy::new(
+        for device_path in devices {
+            let device_proxy = zbus::blocking::Proxy::new(
                 &connection,
                 "org.freedesktop.UPower",
-                "/org/freedesktop/UPower",
-                "org.freedesktop.UPower",
+                device_path.as_str(),
+                "org.freedesktop.UPower.Device",
             )?;
-
-            // Get the list of power-related devices
-            let devices: Vec<OwnedObjectPath> = proxy.call("EnumerateDevices", &())?;
-
-            for device_path in devices {
-                let device_proxy = zbus::blocking::Proxy::new(
-                    &connection,
-                    "org.freedesktop.UPower",
-                    device_path.as_str(),
-                    "org.freedesktop.UPower.Device",
-                )?;
-
-                // Get the Type property (1 = line power / AC)
-                let kind: u32 = device_proxy.get_property("Type")?;
-                if kind == 1 {
-                    // Get the Online property
-                    let online: bool = device_proxy.get_property("Online")?;
-                    return Ok(online);
-                }
+            let kind: u32 = device_proxy.get_property("Type")?;
+            if kind == 1 {
+                return Ok(device_proxy.get_property("Online")?);
             }
         }
 

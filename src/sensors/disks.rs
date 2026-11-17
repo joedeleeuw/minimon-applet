@@ -69,9 +69,9 @@ pub enum UnitVariant {
     Long,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Disks {
-    disks: DisksInfo,
+    disks: std::sync::Arc<std::sync::Mutex<DisksInfo>>,
     write: BoundedVecDeque<u64>,
     read: BoundedVecDeque<u64>,
     max_y: Option<u64>,
@@ -146,11 +146,15 @@ impl Sensor for Disks {
     /// Retrieve the amount of data transmitted since last update.
     fn update(&mut self) {
         let r = DiskRefreshKind::nothing().with_io_usage();
-        self.disks.refresh_specifics(true, r);
+        let mut disks = self
+            .disks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        disks.refresh_specifics(true, r);
         let mut wr = 0;
         let mut rd = 0;
 
-        for disk in self.disks.list() {
+        for disk in disks.list() {
             let usage = disk.usage();
             wr += usage.written_bytes;
             rd += usage.read_bytes;
@@ -347,7 +351,7 @@ impl Default for Disks {
     fn default() -> Self {
         let disks = DisksInfo::new_with_refreshed_list();
         Disks {
-            disks,
+            disks: std::sync::Arc::new(std::sync::Mutex::new(disks)),
             write: BoundedVecDeque::from_iter(std::iter::repeat_n(0, MAX_SAMPLES), MAX_SAMPLES),
             read: BoundedVecDeque::from_iter(std::iter::repeat_n(0, MAX_SAMPLES), MAX_SAMPLES),
             max_y: None,

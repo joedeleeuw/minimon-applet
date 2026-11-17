@@ -64,9 +64,9 @@ pub enum UnitVariant {
     Long,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Network {
-    networks: Networks,
+    networks: std::sync::Arc<std::sync::Mutex<Networks>>,
     download: BoundedVecDeque<u64>,
     upload: BoundedVecDeque<u64>,
     max_y: Option<u64>,
@@ -161,11 +161,15 @@ impl Sensor for Network {
 
     /// Retrieve the amount of data transmitted since last update.
     fn update(&mut self) {
-        self.networks.refresh(true);
+        let mut networks = self
+            .networks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        networks.refresh(true);
         let mut dl = 0;
         let mut ul = 0;
 
-        for (_, network) in &self.networks {
+        for network in networks.values() {
             dl += network.received() * 8;
             ul += network.transmitted() * 8;
         }
@@ -399,7 +403,7 @@ impl Default for Network {
     fn default() -> Self {
         let networks = Networks::new_with_refreshed_list();
         Network {
-            networks,
+            networks: std::sync::Arc::new(std::sync::Mutex::new(networks)),
             download: BoundedVecDeque::from_iter(std::iter::repeat_n(0, MAX_SAMPLES), MAX_SAMPLES),
             upload: BoundedVecDeque::from_iter(std::iter::repeat_n(0, MAX_SAMPLES), MAX_SAMPLES),
             max_y: None,

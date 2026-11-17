@@ -24,7 +24,7 @@ use crate::{
     fl,
     svg_graph::SvgColors,
 };
-use std::any::Any;
+use std::{any::Any, sync::Arc};
 
 use super::gpu::amd::AmdGpu;
 use super::gpu::intel::IntelGpu;
@@ -42,6 +42,7 @@ static DISABLED_COLORS: LazyLock<ChartColors> = LazyLock::new(|| ChartColors {
     color4: cosmic::cosmic_theme::palette::Srgba::from_components((0x72, 0x72, 0x72, 0xFF)),
 });
 
+#[derive(Clone)]
 pub struct GpuGraph {
     id: String,
     samples: BoundedVecDeque<f64>,
@@ -256,6 +257,7 @@ impl DemoGraph for GpuGraph {
     }
 }
 
+#[derive(Clone)]
 pub struct VramGraph {
     id: String,
     samples: BoundedVecDeque<f64>,
@@ -426,6 +428,7 @@ impl VramGraph {
     }
 }
 
+#[derive(Clone)]
 pub struct TempGraph {
     id: String,
     samples: BoundedVecDeque<f64>,
@@ -731,13 +734,23 @@ impl DemoGraph for VramGraph {
     }
 }
 
+#[derive(Clone)]
 pub struct Gpu {
-    gpu_if: Box<dyn GpuIf>,
+    gpu_if: Arc<std::sync::Mutex<Box<dyn GpuIf>>>,
     pub gpu: GpuGraph,
     pub vram: VramGraph,
     pub temp: TempGraph,
     is_laptop: bool,
     config: GpuConfig,
+}
+
+impl std::fmt::Debug for Gpu {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("Gpu")
+            .field("id", &self.id())
+            .finish()
+    }
 }
 
 impl Gpu {
@@ -746,7 +759,7 @@ impl Gpu {
         let id = gpu_if.id();
 
         Gpu {
-            gpu_if,
+            gpu_if: Arc::new(std::sync::Mutex::new(gpu_if)),
             gpu: GpuGraph::new(&id),
             vram: VramGraph::new(&id, total as f64 / 1_073_741_824.0),
             temp: TempGraph::new(&id),
@@ -765,11 +778,17 @@ impl Gpu {
     }
 
     pub fn name(&self) -> String {
-        self.gpu_if.as_ref().name().clone()
+        self.gpu_if
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .name()
     }
 
     pub fn id(&self) -> String {
-        self.gpu_if.as_ref().id().clone()
+        self.gpu_if
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .id()
     }
 
     pub fn set_laptop(&mut self) {
@@ -801,14 +820,18 @@ impl Gpu {
     }
 
     pub fn update(&mut self) {
-        if self.gpu_if.is_active() {
-            if let Ok(sample) = self.gpu_if.usage() {
+        let gpu_if = self
+            .gpu_if
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if gpu_if.is_active() {
+            if let Ok(sample) = gpu_if.usage() {
                 self.gpu.update(sample);
             }
-            if let Ok(sample) = self.gpu_if.vram_used() {
+            if let Ok(sample) = gpu_if.vram_used() {
                 self.vram.update(sample);
             }
-            if let Ok(sample) = self.gpu_if.temperature() {
+            if let Ok(sample) = gpu_if.temperature() {
                 self.temp.update(sample);
             }
         }
@@ -816,7 +839,10 @@ impl Gpu {
 
     pub fn restart(&mut self) {
         info!("Restarting {}", self.name());
-        self.gpu_if.restart();
+        self.gpu_if
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .restart();
         self.gpu.disabled = false;
         self.vram.disabled = false;
         self.temp.disabled = false;
@@ -824,7 +850,10 @@ impl Gpu {
 
     pub fn stop(&mut self) {
         info!("Stopping {}", self.name());
-        self.gpu_if.stop();
+        self.gpu_if
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .stop();
         self.gpu.clear();
         self.vram.clear();
         self.temp.clear();
@@ -834,7 +863,10 @@ impl Gpu {
     }
 
     pub fn is_active(&self) -> bool {
-        self.gpu_if.is_active()
+        self.gpu_if
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .is_active()
     }
 
     fn settings_usage_ui(

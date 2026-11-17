@@ -138,7 +138,7 @@ fn parse_desktop_file(
     let mut categories = Vec::new();
     let mut keywords = Vec::new();
     let mut in_desktop_entry = false;
-    
+
     for line in content.lines() {
         let line = line.trim();
 

@@ -51,12 +51,12 @@ pub static COLOR_CHOICES_LINE_STACKED: std::sync::LazyLock<[(&'static str, Color
         ]
     });
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Memory {
     samples_used: BoundedVecDeque<f64>,
     samples_allocated: BoundedVecDeque<f64>,
     total_memory: f64,
-    system: System,
+    system: std::sync::Arc<std::sync::Mutex<System>>,
     graph_options: Vec<&'static str>,
     /// colors cached so we don't need to convert to string every time
     svg_colors: SvgColors,
@@ -161,10 +161,14 @@ impl Sensor for Memory {
     fn update(&mut self) {
         let r = MemoryRefreshKind::nothing().with_ram();
 
-        self.system.refresh_memory_specifics(r);
-        let new_val_used: f64 = self.system.used_memory() as f64 / 1_073_741_824.0;
+        let mut system = self
+            .system
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        system.refresh_memory_specifics(r);
+        let new_val_used: f64 = system.used_memory() as f64 / 1_073_741_824.0;
         let new_val_allocated: f64 =
-            self.total_memory - (self.system.free_memory() as f64 / 1_073_741_824.0);
+            self.total_memory - (system.free_memory() as f64 / 1_073_741_824.0);
         self.samples_used.push_back(new_val_used);
         self.samples_allocated.push_back(new_val_allocated);
     }
@@ -394,7 +398,7 @@ impl Default for Memory {
                 MAX_SAMPLES,
             ),
             total_memory,
-            system,
+            system: std::sync::Arc::new(std::sync::Mutex::new(system)),
             config: MemoryConfig::default(),
             graph_options: super::GRAPH_OPTIONS_RING_LINE.to_vec(),
             svg_colors: SvgColors::new(&ChartColors::default()),

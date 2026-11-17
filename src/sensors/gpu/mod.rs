@@ -4,7 +4,7 @@ pub mod amd;
 pub mod intel;
 pub mod nvidia;
 
-pub trait GpuIf {
+pub trait GpuIf: Send {
     fn name(&self) -> String;
     fn id(&self) -> String;
     fn usage(&self) -> Result<u32>;

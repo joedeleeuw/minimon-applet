@@ -87,7 +87,7 @@ pub struct CpuLoad {
     pub system_pct: f64,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct Cpu {
     // Total CPU load since last update split into user and system
     total_cpu_load: CpuLoad,

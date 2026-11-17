@@ -35,7 +35,7 @@ use super::{CpuVariant, Sensor, TempUnit};
 
 const MAX_SAMPLES: usize = 21;
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct HwmonTemp {
     pub temp_paths: Vec<PathBuf>,
     pub crit_temp: f64,
@@ -137,7 +137,7 @@ impl HwmonTemp {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct CpuTemp {
     hwmon_temp: Option<HwmonTemp>,
     pub samples: BoundedVecDeque<f64>,

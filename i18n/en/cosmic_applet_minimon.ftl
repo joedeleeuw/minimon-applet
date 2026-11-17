@@ -110,3 +110,5 @@ graph-ring-unused = Unused.
 graph-cpu-load = Load.
 graph-cpu-idle = Idle.
 allocated-explanation = Allocated = total minus free. Includes system cache and buffers, which improve performance and are resized/released as needed.
+config-save-error = Settings could not be saved
+gpu-intel-unsupported = Intel GPU monitoring is unsupported

@@ -57,4 +57,13 @@ impl IntelGpu {
     pub fn get_gpus() -> Vec<Gpu> {
         Vec::new()
     }
+
+    pub fn is_present() -> bool {
+        std::fs::read_dir("/sys/class/drm").is_ok_and(|entries| {
+            entries.flatten().any(|entry| {
+                std::fs::read_to_string(entry.path().join("device/vendor"))
+                    .is_ok_and(|vendor| vendor.trim() == "0x8086")
+            })
+        })
+    }
 }
